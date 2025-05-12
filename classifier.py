@@ -14,12 +14,10 @@ from transformers import (
     Trainer,
     TrainingArguments,
 )
-from sklearn.model_selection import train_test_split
-import numpy as np
-from dotenv import load_dotenv
 import os
-from pathlib import Path
-import random
+import argparse
+
+from helpers import model as helpers
 
 DEVICE = "cpu"
 MODEL_NAME = "meta-llama/Llama-3.2-1B" 
@@ -34,6 +32,16 @@ MAX_LENGTH = 5000
 # label maps
 id2label = {0: "Normal", 1: "Suspicious"}
 label2id = {v:k for k,v in id2label.items()}
+
+# load the dataset
+def load_output_dataset(path, random_seed):
+    dataset = load_dataset("json", data_files=path)
+    dataset = dataset["train"].train_test_split(test_size=0.2, seed=random_seed)
+    print("Dataset loaded.")
+    print(f"Train size: {len(dataset['train'])}")
+    print(f"Test size: {len(dataset['test'])}")
+    print(f"Dataset structure: {dataset}")
+    return dataset
 
 # load the config.yaml file
 def load_config():
@@ -64,109 +72,38 @@ def set_config(config):
         DEVICE = config["device"]
     print("Config loaded.")
 
-# download the pretrained model from huggingface
-def download_pretrained_model(path):
-    load_dotenv()
-    login(token=os.getenv("hugging_face_PAG"))
-    model = AutoModelForSequenceClassification.from_pretrained(
-                                                                MODEL_NAME, 
-                                                                num_labels=len(id2label),
-                                                                id2label=id2label,
-                                                                label2id=label2id
-                                                                ).to(DEVICE)
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, add_prefix_space=True)
-
-    # add pad token if none exists
-    if tokenizer.pad_token is None:
-        tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-        model.resize_token_embeddings(len(tokenizer))\
-      
-    if not os.path.exists(path):
-        os.makedirs(path)
-
-    model.save_pretrained(path)
-    tokenizer.save_pretrained(path)
-    return model, tokenizer
-
-# load the pretrained model from local path
-def load_pretrained_model(path):
-    pretrained_model = AutoModelForSequenceClassification.from_pretrained(
-                                                                path,
-                                                                num_labels=len(id2label),
-                                                                id2label=id2label,
-                                                                label2id=label2id
-                                                                ).to(DEVICE)
-    tokenizer = AutoTokenizer.from_pretrained(path, add_prefix_space=True)
-
-    # add pad token if none exists
-    if tokenizer.pad_token is None:
-        tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-        pretrained_model.resize_token_embeddings(len(tokenizer))
-    return pretrained_model, tokenizer
-
-# tokenize the dataset
-def tokenize_function(examples, tokenizer):
-    text = examples["text"]
-
-    # Tokenize texts in batch mode
-    encoding = tokenizer(
-        text,
-        truncation=True, 
-        padding="max_length", 
-        max_length=MAX_LENGTH,
-        return_tensors="pt"
-    )
-
-    return encoding
-
-# load the dataset
-def load_output_dataset(path):
-    dataset = load_dataset("json", data_files=path)
-    dataset = dataset["train"].train_test_split(test_size=0.2, seed=RANDOM_SEED)
-    print("Dataset loaded.")
-    print(f"Train size: {len(dataset['train'])}")
-    print(f"Test size: {len(dataset['test'])}")
-    print(f"Dataset structure: {dataset}")
-    return dataset
-
 # clear the cuda cache
 def clear_cache():
     torch.cuda.empty_cache()
     torch.backends.cudnn.benchmark = True
     torch.cuda.reset_peak_memory_stats()
 
-if __name__ == "__main__":
-    pre_trained_model, tokenizer = None, None
-    # read the config.yaml file
-    config = load_config()
-    # set the config values 
-    set_config(config)
+
+def run():
+    """
+    sets up and runs the trainer
+    """
 
     # clear cache
     clear_cache()
-
-    # load or download the pretrained model
-    pretrained_exist = config["pretrained_model_exists"]
+    # load pretrained model
     path = os.path.join(MODEL_NAME)
-    if pretrained_exist == False:
-        print("Downloading pretrained model...")
-        pre_trained_model, tokenizer = download_pretrained_model(path)
-    else:
-        print("Loading pretrained model...")
-        pre_trained_model, tokenizer = load_pretrained_model(path)
-    
+    print("Loading pretrained model...")
+    try:
+        pre_trained_model, tokenizer = helpers.load_model(path, DEVICE, label2id)
+    except Exception as e:
+        print("Error loading pretrained model.")
+        print(e)
+        exit(1)
     # load the dataset
     print("Loading dataset...")
-    dataset = load_output_dataset(DATA_PATH)
-
+    dataset = load_output_dataset(DATA_PATH, RANDOM_SEED)
     # data collator
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
-
     # tokenize the dataset
     print("Tokenizing dataset...")
-    tokenized_dataset = dataset.map(lambda x: tokenize_function(x, tokenizer), batched=True)
+    tokenized_dataset = dataset.map(lambda x: helpers.tokenize_function(x, tokenizer, MAX_LENGTH), batched=True)
     print(f"Tokenized dataset structure: {tokenized_dataset}")
-
     # training arguments
     peft_config = LoraConfig(
         task_type="SEQ_CLS",
@@ -177,24 +114,21 @@ if __name__ == "__main__":
     )
     print("PEFT config loaded.")
     print(peft_config)
-
     model = get_peft_model(pre_trained_model, peft_config)
     model.print_trainable_parameters()
     print("Model loaded.")
-
     # Explicitly set padding token in the model config
     model.config.pad_token_id = tokenizer.pad_token_id
-
     # define training arguments
     training_args = TrainingArguments(
-        output_dir= MODEL_NAME + "-lora-text-classification",
+        output_dir=MODEL_NAME + "-lora-text-classification",
         learning_rate=LR,
         per_device_train_batch_size=BATCH_SIZE,
         per_device_eval_batch_size=BATCH_SIZE,
         gradient_accumulation_steps=4,
         num_train_epochs=EPOCHS,
         weight_decay=0.01,
-        eval_strategy = "epoch",
+        eval_strategy="epoch",
         save_strategy="epoch",
         load_best_model_at_end=False,
         gradient_checkpointing=True,
@@ -203,7 +137,6 @@ if __name__ == "__main__":
         seed=RANDOM_SEED,
         label_names=["label"]
     )
-
     trainer = Trainer(
         model=model,
         args=training_args,
@@ -212,15 +145,12 @@ if __name__ == "__main__":
         tokenizer=tokenizer,
         data_collator=data_collator
     )
-
     print("Trainer created.")
-
     # train the model
     print("Training the model...")
     trainer.train()
     print("Model trained.")
-
-    #save the model
+    # save the model
     print("Saving the model...")
     if not os.path.exists(OUTPUT_DIR):
         os.makedirs(OUTPUT_DIR)
@@ -228,3 +158,31 @@ if __name__ == "__main__":
     trainer.save_state()
     tokenizer.save_pretrained(OUTPUT_DIR)
     print("Model saved.")
+
+
+if __name__ == "__main__":
+    # read the config.yaml file
+    config = load_config()
+    # set the config values 
+    set_config(config)
+
+    # * setup argparse
+    parser = argparse.ArgumentParser(
+        prog='classifier',
+        description='basic training script for classifying siem events'
+    )
+    parser.add_argument('-i', '--input',
+                        help='path to input data',
+                        type=str,
+                        default=DATA_PATH)
+    parser.add_argument('-o', '--output',
+                        help='path to output model',
+                        type=str,
+                        default=OUTPUT_DIR)
+    # override defaults
+    args = parser.parse_args()
+
+    DATA_PATH = args.input
+    OUTPUT_DIR = args.output
+
+    run()
